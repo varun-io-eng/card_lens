@@ -13,14 +13,15 @@ app.use(express.static(path.join(__dirname, 'dist')));
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
-// ── Updated free models (April 2026) ──────────────────────────────────────────
-// Ordered by reliability + tool-calling capability. Retried on 429/404.
+// ── Verified free models with tool-calling (April 2026) ──────────────────────
+// openrouter/free auto-routes to whatever free model supports tool use right now.
+// It is first because it is the only guaranteed-available option.
 const FREE_MODELS = [
-  'meta-llama/llama-3.3-70b-instruct:free',  // best overall free model; strong tool use
-  'qwen/qwen3-235b-a22b:free',               // 235B MoE; confirmed tool-calling support
-  'google/gemma-3-27b-it:free',              // Gemma 3 27B; vision + tools tags
-  'deepseek/deepseek-r1:free',               // strong reasoning; free tier available
-  'openrouter/free',                         // OpenRouter auto-router — picks best free model
+  'openrouter/free',                         // #1: auto-picks best available free+tools model
+  'meta-llama/llama-3.3-70b-instruct:free',  // strong but low daily quota — may rate-limit fast
+  'nvidia/nemotron-3-nano-30b-a3b:free',     // confirmed Tools tag; lighter quota
+  'qwen/qwen3-8b:free',                      // small Qwen3; free + tools confirmed
+  'arcee-ai/trinity-large-preview:free',     // community free model with tool support
 ];
 
 if (!OPENROUTER_API_KEY) {
@@ -355,7 +356,24 @@ async function runAgentLoop(userMessage, agentSteps) {
 
     // No tool calls → final answer
     if (!message.tool_calls || message.tool_calls.length === 0) {
-      const content = (message.content || '').trim();
+      let content = (message.content || '').trim();
+
+      // Some reasoning models (e.g. DeepSeek R1, certain openrouter/free picks) place
+      // their final answer inside reasoning_details instead of content.
+      // Extract the last text block from reasoning_details as a fallback.
+      if (!content && data.choices?.[0]?.message?.reasoning_details) {
+        const rd = data.choices[0].message.reasoning_details;
+        const lastText = [...rd].reverse().find(b => b.type === 'text');
+        content = (lastText?.text || '').trim();
+        if (content) console.log('  ℹ️  Content extracted from reasoning_details');
+      }
+
+      // Second fallback: check the raw content array for text blocks
+      if (!content && Array.isArray(message.content)) {
+        const textBlock = message.content.find(b => b.type === 'text');
+        content = (textBlock?.text || '').trim();
+      }
+
       if (!content) throw new Error('Agent returned empty response');
       console.log('\n✅ Agent done.');
       return { finalAnswer: content, steps: agentSteps };
@@ -448,7 +466,7 @@ app.use((req, res) => {
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`\n💳 CardLens → http://localhost:${PORT}`);
-  console.log(`🤖 Models : ${FREE_MODELS[0]} + ${FREE_MODELS.length - 1} fallbacks (tool-calling)`);
+  console.log(`🤖 Models : ${FREE_MODELS.join(' → ')}`);  // show full chain
 
   console.log(`🛠️  Tools  : fetch_card_details | search_web (Tavily) | check_rbi_policy`);
   console.log(`\n✅ Server running. Press Ctrl+C to stop.\n`);
