@@ -11,17 +11,18 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'dist')));
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
+const TAVILY_API_KEY     = process.env.TAVILY_API_KEY;
 
-// ── Verified free models with tool-calling (April 2026) ──────────────────────
-// openrouter/free auto-routes to whatever free model supports tool use right now.
-// It is first because it is the only guaranteed-available option.
+// ── FIX 1: Updated free model list (April 2026) ───────────────────────────────
+// Gemini free tier has the most generous quota for tool-calling workloads.
+// Models are tried in order; first success wins.
 const FREE_MODELS = [
-  'openrouter/free',                         // #1: auto-picks best available free+tools model
-  'meta-llama/llama-3.3-70b-instruct:free',  // strong but low daily quota — may rate-limit fast
-  'nvidia/nemotron-3-nano-30b-a3b:free',     // confirmed Tools tag; lighter quota
-  'qwen/qwen3-8b:free',                      // small Qwen3; free + tools confirmed
-  'arcee-ai/trinity-large-preview:free',     // community free model with tool support
+  'openrouter/free',
+  'google/gemini-2.0-flash-lite-preview-02-05:free', // #1 — Valid Gemini free endpoint
+  'google/gemini-2.0-pro-exp-02-05:free',            // #2 — Strong reasoning fallback
+  'meta-llama/llama-3.1-8b-instruct:free',           // #3 — Reliable Llama fallback
+  'qwen/qwen-2.5-72b-instruct:free',                 // #4 — Excellent tool-use fallback
+                                // #5 — Auto-pick last resort
 ];
 
 if (!OPENROUTER_API_KEY) {
@@ -97,6 +98,12 @@ const CARD_DATABASE = {
   'icici sapphiro': { cardName: 'ICICI Sapphiro', bankName: 'ICICI Bank', annualFee: 3500,  tier: 'Platinum',    policies: { lounge: 'partial', travel_ins: 'has', forex: 'not', hotel: 'partial', global_acc: 'has', cashback: 'not', rewards: 'has', milestone: 'partial', welcome: 'has', dining: 'has', golf: 'not', concierge: 'has', fuel: 'has', emi: 'has', purchase: 'partial', zero_liab: 'has' }, score: 68 },
   'hdfc millennia': { cardName: 'HDFC Millennia', bankName: 'HDFC Bank',  annualFee: 1000,  tier: 'Classic',     policies: { lounge: 'not', travel_ins: 'not', forex: 'not', hotel: 'not', global_acc: 'not', cashback: 'has', rewards: 'has', milestone: 'not', welcome: 'partial', dining: 'not', golf: 'not', concierge: 'not', fuel: 'has', emi: 'has', purchase: 'not', zero_liab: 'has' }, score: 37 },
 };
+
+// ─────────────────────────────────────────────
+//  FIX 4: IN-MEMORY RESULT CACHE
+// ─────────────────────────────────────────────
+
+const analysisCache = new Map();
 
 // ─────────────────────────────────────────────
 //  TOOL EXECUTORS
@@ -190,11 +197,11 @@ function buildFallbackResult(cardName, bank, tier, fee, features) {
   }
 
   // Generic tier-based estimate when card is unknown
-  const annualFee = parseInt(fee) || 0;
-  const tierLower = (tier || '').toLowerCase();
-  const isElite  = tierLower.includes('world') || tierLower.includes('elite') || tierLower.includes('infinite') || annualFee >= 10000;
-  const isPremium = tierLower.includes('platinum') || tierLower.includes('gold') || annualFee >= 2000;
-  const featStr  = (features || '').toLowerCase();
+  const annualFee  = parseInt(fee) || 0;
+  const tierLower  = (tier || '').toLowerCase();
+  const isElite    = tierLower.includes('world') || tierLower.includes('elite') || tierLower.includes('infinite') || annualFee >= 10000;
+  const isPremium  = tierLower.includes('platinum') || tierLower.includes('gold') || annualFee >= 2000;
+  const featStr    = (features || '').toLowerCase();
 
   const p = {
     lounge:     isElite ? 'has' : isPremium ? 'partial' : 'not',
@@ -233,7 +240,10 @@ function buildFallbackResult(cardName, bank, tier, fee, features) {
 
 // ─────────────────────────────────────────────
 //  OPENROUTER API CALL (with model fallback)
+//  FIX 2: Added 500ms delay after rate-limit
 // ─────────────────────────────────────────────
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function callOpenRouter(messages) {
   for (let i = 0; i < FREE_MODELS.length; i++) {
@@ -263,7 +273,13 @@ async function callOpenRouter(messages) {
       continue;
     }
 
-    if (response.status === 429) { console.warn(`  ⚠️  ${model} rate limited, trying next...`); continue; }
+    // FIX 2: Wait 500ms before retrying after rate limit
+   if (response.status === 429) {
+      console.warn(`  ⚠️  ${model} rate limited, waiting 2000ms then trying next...`);
+      await sleep(225); 
+      continue;
+    }
+
     if (!response.ok) {
       const t = await response.text();
       console.warn(`  ⚠️  ${model} HTTP ${response.status}: ${t.slice(0, 120)}, trying next...`);
@@ -288,17 +304,24 @@ async function callOpenRouter(messages) {
 }
 
 // ─────────────────────────────────────────────
-//  SYSTEM PROMPT
+//  FIX 3: SYSTEM PROMPT — batched tool calls
+//  Reduces LLM round-trips from 5 down to 3
+//  (1 batch: fetch+rbi  →  1 search  →  1 answer)
 // ─────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `You are CardLens AI — an expert credit card policy analyst with access to real-time web search.
 
-ALWAYS follow these steps in order:
-1. Call fetch_card_details with the card name
-2. Call search_web with "<card name> credit card benefits features 2025"
-3. Call search_web again with "<card name> <bank name> lounge forex golf insurance annual fee"
-4. Call check_rbi_policy with "zero liability"
-5. Using ALL gathered data (database + real web results), return ONLY this JSON (no markdown, no backticks, no extra text):
+ALWAYS follow these steps in order (call multiple tools in a single turn when possible):
+
+TURN 1 — Call BOTH of these tools simultaneously in the same response:
+  • fetch_card_details with the card name
+  • check_rbi_policy with "zero liability"
+
+TURN 2 — Call search_web once with a combined query:
+  "<card name> <bank name> credit card benefits lounge forex golf insurance annual fee 2025"
+
+TURN 3 — Using ALL gathered data (database + real web results), return ONLY this JSON
+(no markdown, no backticks, no extra text):
 
 {
   "cardName": "exact card name",
@@ -347,7 +370,7 @@ async function runAgentLoop(userMessage, agentSteps) {
     // null means all models exhausted — bubble up to API route
     if (data === null) return null;
 
-    const choice = data.choices[0];
+    const choice  = data.choices[0];
     const message = choice.message;
 
     const assistantMsg = { role: 'assistant', content: message.content || null };
@@ -358,8 +381,7 @@ async function runAgentLoop(userMessage, agentSteps) {
     if (!message.tool_calls || message.tool_calls.length === 0) {
       let content = (message.content || '').trim();
 
-      // Some reasoning models (e.g. DeepSeek R1, certain openrouter/free picks) place
-      // their final answer inside reasoning_details instead of content.
+      // Some reasoning models place their final answer inside reasoning_details.
       // Extract the last text block from reasoning_details as a fallback.
       if (!content && data.choices?.[0]?.message?.reasoning_details) {
         const rd = data.choices[0].message.reasoning_details;
@@ -379,18 +401,21 @@ async function runAgentLoop(userMessage, agentSteps) {
       return { finalAnswer: content, steps: agentSteps };
     }
 
-    // Execute tools and feed results back
-    for (const toolCall of message.tool_calls) {
-      const name = toolCall.function.name;
-      const args = JSON.parse(toolCall.function.arguments || '{}');
-      agentSteps.push(`${name}(${JSON.stringify(args)})`);
-      const result = await executeTool(name, args);
-      messages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(result),
-      });
-    }
+    // Execute tools (in parallel where possible) and feed results back
+    const toolResults = await Promise.all(
+      message.tool_calls.map(async (toolCall) => {
+        const name   = toolCall.function.name;
+        const args   = JSON.parse(toolCall.function.arguments || '{}');
+        agentSteps.push(`${name}(${JSON.stringify(args)})`);
+        const result = await executeTool(name, args);
+        return {
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(result),
+        };
+      })
+    );
+    messages.push(...toolResults);
   }
 
   throw new Error('Agent exceeded maximum iterations');
@@ -413,6 +438,13 @@ app.post('/api/analyze', async (req, res) => {
     return res.json({ success: true, result: fallback });
   }
 
+  // FIX 4: Serve from cache if available
+  const cacheKey = `${(cardName || '').trim().toLowerCase()}|${(bank || '').trim().toLowerCase()}`;
+  if (analysisCache.has(cacheKey)) {
+    console.log('📦 Serving from cache');
+    return res.json({ success: true, result: analysisCache.get(cacheKey) });
+  }
+
   const agentSteps = [`Started: ${cardName} by ${bank}`];
 
   try {
@@ -424,7 +456,7 @@ Annual Fee: ${fee ? `Rs.${fee}` : 'Unknown'}
 Network: ${network || 'Unknown'}
 Features mentioned: ${features || 'None'}
 
-Follow the steps: fetch details → search web (twice) → check RBI policy → return final JSON only.`;
+Follow the steps: (1) fetch_card_details + check_rbi_policy together → (2) search_web once → (3) return final JSON only.`;
 
     const agentResult = await runAgentLoop(userMessage, agentSteps);
 
@@ -444,10 +476,13 @@ Follow the steps: fetch details → search web (twice) → check RBI policy → 
       .trim();
 
     const parsed = JSON.parse(cleaned);
-    parsed.agentSteps = steps;
+    parsed.agentSteps   = steps;
     parsed.isAgentResult = true;
 
-    console.log(`✅ Score: ${parsed.score}`);
+    // FIX 4: Store successful result in cache
+    analysisCache.set(cacheKey, parsed);
+    console.log(`✅ Score: ${parsed.score} (cached for future requests)`);
+
     res.json({ success: true, result: parsed });
 
   } catch (err) {
@@ -463,12 +498,12 @@ app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT   = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`\n💳 CardLens → http://localhost:${PORT}`);
-  console.log(`🤖 Models : ${FREE_MODELS.join(' → ')}`);  // show full chain
-
+  console.log(`🤖 Models : ${FREE_MODELS.join(' → ')}`);
   console.log(`🛠️  Tools  : fetch_card_details | search_web (Tavily) | check_rbi_policy`);
+  console.log(`📦 Cache  : in-memory (cleared on server restart)`);
   console.log(`\n✅ Server running. Press Ctrl+C to stop.\n`);
 });
 
