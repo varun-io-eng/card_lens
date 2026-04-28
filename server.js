@@ -276,7 +276,7 @@ async function callOpenRouter(messages) {
     // FIX 2: Wait 500ms before retrying after rate limit
    if (response.status === 429) {
       console.warn(`  ⚠️  ${model} rate limited, waiting 2000ms then trying next...`);
-      await sleep(200); 
+      await sleep(225); 
       continue;
     }
 
