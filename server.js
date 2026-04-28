@@ -13,13 +13,14 @@ app.use(express.static(path.join(__dirname, 'dist')));
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
-// Free models tried in order — skips to next on rate limit
+// ── Updated free models (April 2026) ──────────────────────────────────────────
+// Ordered by reliability + tool-calling capability. Retried on 429/404.
 const FREE_MODELS = [
-  'openrouter/free',
-  'google/gemma-4-31b-it:free',
-  'google/gemma-4-26b-a4b-it:free',
-  'meta-llama/llama-3.3-70b-instruct:free',
-  'qwen/qwen-2.5-7b-instruct:free',
+  'meta-llama/llama-3.3-70b-instruct:free',  // best overall free model; strong tool use
+  'qwen/qwen3-235b-a22b:free',               // 235B MoE; confirmed tool-calling support
+  'google/gemma-3-27b-it:free',              // Gemma 3 27B; vision + tools tags
+  'deepseek/deepseek-r1:free',               // strong reasoning; free tier available
+  'openrouter/free',                         // OpenRouter auto-router — picks best free model
 ];
 
 if (!OPENROUTER_API_KEY) {
@@ -167,6 +168,69 @@ async function executeTool(name, args) {
 }
 
 // ─────────────────────────────────────────────
+//  DATABASE FALLBACK — used when all LLMs fail
+// ─────────────────────────────────────────────
+
+function buildFallbackResult(cardName, bank, tier, fee, features) {
+  const dbResult = fetchCardDetails(cardName || '');
+
+  if (dbResult.found) {
+    const d = dbResult.data;
+    return {
+      cardName: d.cardName,
+      bankName: d.bankName,
+      score: d.score,
+      summary: `${d.cardName} is a ${d.tier} card by ${d.bankName} with an annual fee of ₹${d.annualFee}. It includes key travel benefits like lounge access and forex waiver, along with a strong rewards programme. Data served from the CardLens local database.`,
+      dataSource: 'CardLens Database (offline fallback)',
+      policies: d.policies,
+      agentSteps: [`Database lookup: found ${d.cardName}`],
+      isAgentResult: false,
+    };
+  }
+
+  // Generic tier-based estimate when card is unknown
+  const annualFee = parseInt(fee) || 0;
+  const tierLower = (tier || '').toLowerCase();
+  const isElite  = tierLower.includes('world') || tierLower.includes('elite') || tierLower.includes('infinite') || annualFee >= 10000;
+  const isPremium = tierLower.includes('platinum') || tierLower.includes('gold') || annualFee >= 2000;
+  const featStr  = (features || '').toLowerCase();
+
+  const p = {
+    lounge:     isElite ? 'has' : isPremium ? 'partial' : 'not',
+    travel_ins: isElite ? 'has' : isPremium ? 'partial' : 'not',
+    forex:      isElite ? 'has' : 'not',
+    hotel:      isElite ? 'has' : isPremium ? 'partial' : 'not',
+    global_acc: isElite ? 'has' : isPremium ? 'partial' : 'not',
+    cashback:   featStr.includes('cashback') ? 'has' : 'not',
+    rewards:    isPremium || isElite ? 'has' : 'partial',
+    milestone:  isElite ? 'has' : isPremium ? 'partial' : 'not',
+    welcome:    isPremium || isElite ? 'has' : 'not',
+    dining:     isElite ? 'has' : isPremium ? 'partial' : 'not',
+    golf:       isElite ? 'has' : 'not',
+    concierge:  isElite ? 'has' : isPremium ? 'partial' : 'not',
+    fuel:       'has',
+    emi:        'has',
+    purchase:   isPremium || isElite ? 'partial' : 'not',
+    zero_liab:  'has',
+  };
+
+  const hasCount     = Object.values(p).filter(v => v === 'has').length;
+  const partialCount = Object.values(p).filter(v => v === 'partial').length;
+  const estimatedScore = Math.round((hasCount + partialCount * 0.5) / 16 * 100);
+
+  return {
+    cardName: cardName || 'Unknown Card',
+    bankName: bank || 'Unknown Bank',
+    score: estimatedScore,
+    summary: `${cardName || 'This card'} from ${bank || 'your bank'} appears to be a ${tier || 'standard'} tier card. Results are estimated from card tier and fee since live AI analysis is temporarily unavailable. Please try again shortly for accurate data.`,
+    dataSource: 'Tier-based estimate (AI offline)',
+    policies: p,
+    agentSteps: ['Database lookup: not found', 'Tier-based estimate applied'],
+    isAgentResult: false,
+  };
+}
+
+// ─────────────────────────────────────────────
 //  OPENROUTER API CALL (with model fallback)
 // ─────────────────────────────────────────────
 
@@ -175,33 +239,51 @@ async function callOpenRouter(messages) {
     const model = FREE_MODELS[i];
     console.log(`  📡 Trying: ${model}`);
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'CardLens',
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 4000,
-        messages,
-        tools: TOOLS,
-        tool_choice: 'auto',
-      }),
-    });
+    let response;
+    try {
+      response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+          'HTTP-Referer': 'http://localhost:3000',
+          'X-Title': 'CardLens',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 4000,
+          messages,
+          tools: TOOLS,
+          tool_choice: 'auto',
+        }),
+      });
+    } catch (networkErr) {
+      console.warn(`  ⚠️  ${model} network error: ${networkErr.message}, trying next...`);
+      continue;
+    }
 
     if (response.status === 429) { console.warn(`  ⚠️  ${model} rate limited, trying next...`); continue; }
-    if (!response.ok) { const t = await response.text(); throw new Error(`OpenRouter ${response.status}: ${t}`); }
+    if (!response.ok) {
+      const t = await response.text();
+      console.warn(`  ⚠️  ${model} HTTP ${response.status}: ${t.slice(0, 120)}, trying next...`);
+      continue;
+    }
 
     const data = await response.json();
     if (data.error) { console.warn(`  ⚠️  ${model} error: ${data.error.message}, trying next...`); continue; }
 
+    const finish = data.choices?.[0]?.finish_reason;
+    if (finish === 'terminated') {
+      console.warn(`  ⚠️  ${model} terminated (no tool support), trying next...`);
+      continue;
+    }
+
     console.log(`  ✅ Model: ${model}`);
     return data;
   }
-  throw new Error('All free models are rate limited. Please try again in a minute.');
+
+  // All models exhausted — signal caller to use fallback
+  return null;
 }
 
 // ─────────────────────────────────────────────
@@ -260,6 +342,10 @@ async function runAgentLoop(userMessage, agentSteps) {
     console.log(`\n  🤖 Iteration ${iteration}`);
 
     const data = await callOpenRouter(messages);
+
+    // null means all models exhausted — bubble up to API route
+    if (data === null) return null;
+
     const choice = data.choices[0];
     const message = choice.message;
 
@@ -304,7 +390,9 @@ app.post('/api/analyze', async (req, res) => {
   console.log(`${'═'.repeat(50)}`);
 
   if (!OPENROUTER_API_KEY) {
-    return res.status(500).json({ success: false, error: 'OPENROUTER_API_KEY not configured in .env', fallback: true });
+    console.warn('⚠️  No API key — serving database/estimate fallback');
+    const fallback = buildFallbackResult(cardName, bank, tier, fee, features);
+    return res.json({ success: true, result: fallback });
   }
 
   const agentSteps = [`Started: ${cardName} by ${bank}`];
@@ -320,7 +408,16 @@ Features mentioned: ${features || 'None'}
 
 Follow the steps: fetch details → search web (twice) → check RBI policy → return final JSON only.`;
 
-    const { finalAnswer, steps } = await runAgentLoop(userMessage, agentSteps);
+    const agentResult = await runAgentLoop(userMessage, agentSteps);
+
+    // agentResult === null means all LLMs were rate-limited/unavailable
+    if (agentResult === null) {
+      console.warn('⚠️  All models unavailable — serving database/estimate fallback');
+      const fallback = buildFallbackResult(cardName, bank, tier, fee, features);
+      return res.json({ success: true, result: fallback });
+    }
+
+    const { finalAnswer, steps } = agentResult;
 
     const cleaned = finalAnswer
       .replace(/^```json\s*/i, '')
@@ -337,7 +434,10 @@ Follow the steps: fetch details → search web (twice) → check RBI policy → 
 
   } catch (err) {
     console.error('❌ Error:', err.message);
-    res.status(500).json({ success: false, error: err.message, fallback: true });
+    // On any parse/agent error, still serve a graceful fallback
+    const fallback = buildFallbackResult(cardName, bank, tier, fee, features);
+    fallback.agentSteps.push(`Error: ${err.message}`);
+    res.json({ success: true, result: fallback });
   }
 });
 
@@ -348,7 +448,8 @@ app.use((req, res) => {
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`\n💳 CardLens → http://localhost:${PORT}`);
-  console.log(`🤖 Models : ${FREE_MODELS[0]} + ${FREE_MODELS.length - 1} fallbacks`);
+  console.log(`🤖 Models : ${FREE_MODELS[0]} + ${FREE_MODELS.length - 1} fallbacks (tool-calling)`);
+
   console.log(`🛠️  Tools  : fetch_card_details | search_web (Tavily) | check_rbi_policy`);
   console.log(`\n✅ Server running. Press Ctrl+C to stop.\n`);
 });
