@@ -1,26 +1,28 @@
 # 💳 CardLens — AI Credit Card Policy Analyzer
 
-A professional, production-grade React application that analyzes credit card policies and benefits using Claude AI. Upload your card image or enter details manually to instantly see which benefits your card includes, which are conditional, and which are missing.
+A professional, production-grade React application that analyzes credit card policies and benefits using an **agentic AI backend**. Enter your card details and the AI agent autonomously searches databases, runs live web searches, and checks RBI regulations to give you a full policy breakdown with score, radar chart, and summary.
 
 ---
 
 ## 📸 Preview
 
-> Enter your card details or upload a card image → Click Analyze → Get a full policy breakdown with score, radar chart, and AI insight.
+> Enter your card details → Click Analyze → The AI agent runs its tool loop → Get a full policy breakdown with score, radar chart, and AI insight.
 
 ---
 
 ## ✨ Features
 
 - 🃏 **Live 3D Card Preview** — Interactive card that tilts on mouse movement with 5 color themes
-- 📁 **Image Upload** — Drag & drop your card image, Claude reads it directly
-- 🤖 **Claude AI Analysis** — Real AI-powered policy detection based on actual card knowledge
+- 🤖 **Agentic AI Analysis** — Multi-step AI agent with tool-calling (database lookup + live web search + RBI policy check)
+- 🌐 **Real-Time Web Search** — Tavily integration for up-to-date card benefit information
 - 📊 **Radar Chart** — Visual coverage breakdown across Travel, Rewards, Lifestyle, Everyday, Security
 - 🎯 **Score Ring** — Animated 0–100 coverage score
 - ✅ **16 Policy Categories** — Color coded as Included / Partial / Not Included
 - 🔍 **Filter & Tab System** — Filter by status and category
-- 💡 **AI Insight** — Natural language summary of your card's value proposition
-- 🔒 **Secure Backend Proxy** — API key never exposed to the browser
+- 💡 **AI Summary** — Natural language summary of your card's value proposition
+- 🔄 **Model Fallback Chain** — Automatically tries multiple free LLMs via OpenRouter if one fails
+- 📦 **In-Memory Cache** — Repeated lookups for the same card are served instantly
+- 🛡️ **Graceful Fallback** — Local database + tier-based estimate when AI is unavailable
 
 ---
 
@@ -28,14 +30,14 @@ A professional, production-grade React application that analyzes credit card pol
 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
-| Framework | **React 18** + **Vite** | Component architecture, fast builds |
+| Framework | **React 19** + **Vite** | Component architecture, fast builds |
 | Animations | **Framer Motion** | 3D card tilt, transitions, staggered lists |
 | Charts | **Recharts** | Radar chart for category coverage |
-| File Upload | **react-dropzone** | Drag & drop with animated states |
 | Icons | **lucide-react** | Clean SVG icons |
 | Notifications | **react-hot-toast** | Toast messages |
-| Backend | **Express.js** | Secure API proxy server |
-| AI | **Claude API** (Anthropic) | Policy analysis from card details or image |
+| Backend | **Express.js** | Agentic loop server + secure API proxy |
+| AI Router | **OpenRouter** | Routes requests to free LLMs (Gemini, Llama, Qwen) |
+| Web Search | **Tavily** | Real-time credit card benefit lookups |
 
 ---
 
@@ -56,7 +58,7 @@ cardlens-react/
 │   │   └── policies.js         # Policy definitions, banks, tiers
 │   ├── App.jsx                 # Main layout and state management
 │   └── main.jsx                # React entry point
-├── server.js                   # Express backend proxy
+├── server.js                   # Express backend — agentic loop, tools, fallback
 ├── index.html                  # HTML entry point
 ├── vite.config.js              # Vite configuration
 ├── .env.example                # Environment variable template
@@ -71,7 +73,8 @@ cardlens-react/
 ### Prerequisites
 - Node.js v18 or higher
 - npm
-- Anthropic API key from [console.anthropic.com](https://console.anthropic.com)
+- OpenRouter API key from [openrouter.ai](https://openrouter.ai) (free tier available)
+- Tavily API key from [tavily.com](https://tavily.com) (optional — enables live web search)
 
 ### Installation
 
@@ -88,9 +91,11 @@ npm install
 
 **3. Set up environment variables**
 
-Rename `.env.example` to `.env` and add your API key:
+Rename `.env.example` to `.env` and fill in your keys:
 ```
-ANTHROPIC_API_KEY=sk-ant-your-key-here
+OPENROUTER_API_KEY=your-openrouter-key-here
+TAVILY_API_KEY=your-tavily-key-here   # Optional — enables real web search
+PORT=3000
 ```
 
 **4. Build the React app**
@@ -112,22 +117,76 @@ http://localhost:3000
 
 ## 💻 Development Mode
 
-To run the frontend in dev mode with hot reload:
+To run the frontend with hot reload:
 ```bash
 npm run dev
 ```
-> Note: In dev mode the API calls go directly to Anthropic (may hit CORS). Use the Express server for reliable API calls.
+> Note: In dev mode, API calls go to the Vite dev server. Run `node server.js` separately for the agentic backend.
 
 ---
 
 ## 🔐 Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `ANTHROPIC_API_KEY` | Your Anthropic API key |
-| `PORT` | Server port (default: 3000) |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `OPENROUTER_API_KEY` | ✅ Yes | Routes requests to free LLMs (Gemini, Llama, Qwen) |
+| `TAVILY_API_KEY` | ⚡ Optional | Enables real-time web search for card benefits |
+| `PORT` | ⚡ Optional | Server port (default: 3000) |
 
 > ⚠️ Never commit your `.env` file. It is already listed in `.gitignore`.
+
+---
+
+## 🤖 How the Agentic Loop Works
+
+CardLens does not make a single AI call — it runs a **multi-step agent** that autonomously decides which tools to use and loops until it has a complete answer.
+
+```
+User submits card details
+        ↓
+Agent Turn 1 — calls TWO tools simultaneously:
+  • fetch_card_details  →  checks local CardLens database
+  • check_rbi_policy    →  looks up RBI mandate for zero liability
+        ↓
+Agent Turn 2 — calls one tool:
+  • search_web          →  live Tavily search for real card benefits
+        ↓
+Agent Turn 3 — synthesizes all results, returns final JSON
+        ↓
+Server parses JSON, caches result, sends to frontend
+        ↓
+Frontend renders score ring, radar chart, policy list
+```
+
+The loop runs up to **10 iterations** and supports **parallel tool calls** in a single turn. If the LLM returns empty content, the server extracts the answer from `reasoning_details` as a fallback.
+
+---
+
+## 🔄 Model Fallback Chain
+
+If a model is rate-limited or unavailable, the server automatically tries the next one:
+
+```
+openrouter/free
+  → google/gemini-2.0-flash-lite-preview-02-05:free
+  → google/gemini-2.0-pro-exp-02-05:free
+  → meta-llama/llama-3.1-8b-instruct:free
+  → qwen/qwen-2.5-72b-instruct:free
+```
+
+A 2-second delay is applied between retries on rate-limit (HTTP 429) responses.
+
+---
+
+## 🛡️ Fallback Modes
+
+When AI is unavailable, CardLens degrades gracefully:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Card found in local DB | Returns stored policy data with note |
+| Card not in DB | Estimates from tier + annual fee |
+| All LLMs rate-limited | Same DB/estimate fallback applies |
 
 ---
 
@@ -154,16 +213,19 @@ npm run dev
 
 ---
 
-## 🧠 How It Works
+## 🗃️ Built-in Card Database
 
-1. **You enter** card details (bank, tier, fee, network, features) or upload a card image
-2. **The frontend** sends the data to `/api/analyze` on the Express server
-3. **The server** forwards the request to Claude AI with a structured prompt
-4. **Claude AI** analyzes the card based on its knowledge of real card products and returns a JSON with policy statuses
-5. **The frontend** renders the results — score ring, radar chart, and color-coded policy list
+The following cards are pre-loaded for instant offline lookups:
 
-### Fallback (No API Key)
-If no API key is configured, the app falls back to a rule-based estimate using card tier and annual fee. Results are approximate and change on every analysis.
+| Card | Bank | Tier | Annual Fee | Score |
+|------|------|------|-----------|-------|
+| HDFC Regalia | HDFC Bank | Platinum | ₹2,500 | 81 |
+| Axis Magnus | Axis Bank | World Elite | ₹10,000 | 94 |
+| SBI Card Elite | SBI Card | Platinum | ₹4,999 | 78 |
+| ICICI Sapphiro | ICICI Bank | Platinum | ₹3,500 | 68 |
+| HDFC Millennia | HDFC Bank | Classic | ₹1,000 | 37 |
+
+Cards not in the database are analyzed live by the AI agent via web search.
 
 ---
 
@@ -183,10 +245,10 @@ If no API key is configured, the app falls back to a rule-based estimate using c
 ## 📦 Scripts
 
 ```bash
-npm run dev      # Start Vite dev server
+npm run dev      # Start Vite dev server (frontend only)
 npm run build    # Build for production
 npm run preview  # Preview production build
-node server.js   # Start Express server
+node server.js   # Start Express server with agentic backend
 ```
 
 ---
